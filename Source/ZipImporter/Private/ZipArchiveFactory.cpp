@@ -37,7 +37,7 @@ UObject* UZipArchiveFactory::FactoryCreateFile(
 	{
 		return nullptr;
 	}
-
+ 
 	FZipImporterModule* Module =
 		FModuleManager::GetModulePtr<FZipImporterModule>(TEXT("ZipImporter"));
 
