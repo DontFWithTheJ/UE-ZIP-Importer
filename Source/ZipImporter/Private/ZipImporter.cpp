@@ -7,7 +7,8 @@
 #include "DesktopPlatformModule.h"
 #include "EditorReimportHandler.h"
 #include "FileHelpers.h"
-#include "FileUtilities/ZipArchiveReader.h"
+#include "libzip/zip.h"
+#include "Misc/ScopeExit.h"
 #include "Framework/Application/SlateApplication.h"
 #include "HAL/FileManager.h"
 #include "HAL/PlatformFileManager.h"
@@ -17,7 +18,7 @@
 #include "Misc/MessageDialog.h"
 #include "Misc/PackageName.h"
 #include "Misc/Paths.h"
-#include "ToolMenus.h"
+#include "ObjectTools.h"
 #include "UObject/MetaData.h"
 #include "UObject/Package.h"
 
@@ -31,6 +32,8 @@ namespace ZipImporter
 	static constexpr int32 MaxArchiveDepth = 8;
 	static constexpr int32 MaxArchiveFiles = 10000;
 	static constexpr int64 MaxSingleFileSize = 512ll * 1024ll * 1024ll;
+
+	static constexpr int64 MaxTotalSize = 4ll * 1024 * 1024 * 1024;
 
 	struct FImportSource
 	{
@@ -46,6 +49,7 @@ namespace ZipImporter
 		TArray<FImportSource> Sources;
 		TArray<FString> FailedPaths;
 		TSet<FString> VisitedArchives;
+		int64 ExtractedBytes = 0;
 		int32 ProcessedFiles = 0;
 		int32 ImportedObjects = 0;
 	};
@@ -245,72 +249,60 @@ namespace ZipImporter
 		return false;
 	}
 
-	bool ReadArchiveEntry(
-		const FString& ArchivePath,
-		const FString& EntryPath,
-		TArray<uint8>& OutData,
-		FString& OutError)
-	{
-		FString SafePath;
+    bool ReadEntry(zip_t* Archive, zip_uint64_t Index, int64 Remaining, TArray<uint8>& Data)
+    {
+        zip_stat_t Stat;
+        if (zip_stat_index(Archive, Index, 0, &Stat) != 0 || !(Stat.valid & ZIP_STAT_SIZE)
+            || Stat.size > static_cast<uint64>(FMath::Min(MaxSingleFileSize, Remaining)))
+        {
+            return false;
+        }
+        zip_file_t* Entry = zip_fopen_index(Archive, Index, 0);
+        if (!Entry)
+        {
+            return false;
+        }
+        Data.SetNumUninitialized(static_cast<int32>(Stat.size));
+        const bool bRead = Data.IsEmpty() || zip_fread(Entry, Data.GetData(), Stat.size) == static_cast<zip_int64_t>(Stat.size);
+        uint8 Extra;
+        const bool bAtEnd = bRead && zip_fread(Entry, &Extra, 1) == 0;
+        return zip_fclose(Entry) == 0 && bAtEnd;
+    }
 
-		if (!IsSafeRelativePath(EntryPath, SafePath))
-		{
-			OutError = FString::Printf(
-				TEXT("Unsafe path inside archive:\n%s"),
-				*EntryPath);
-			return false;
-		}
-
-		if (!FPaths::FileExists(ArchivePath))
-		{
-			OutError = FString::Printf(
-				TEXT("Archive file does not exist:\n%s"),
-				*ArchivePath);
-			return false;
-		}
-
-		IPlatformFile& PlatformFile = FPlatformFileManager::Get().GetPlatformFile();
-		IFileHandle* FileHandle = PlatformFile.OpenRead(*ArchivePath);
-
-		if (!FileHandle)
-		{
-			OutError = FString::Printf(
-				TEXT("Could not open archive:\n%s"),
-				*ArchivePath);
-			return false;
-		}
-
-		FZipArchiveReader ArchiveReader(FileHandle, nullptr);
-
-		if (!ArchiveReader.IsValid())
-		{
-			OutError = FString::Printf(
-				TEXT("Could not read ZIP archive:\n%s"),
-				*ArchivePath);
-			return false;
-		}
-
-		if (!ArchiveReader.TryReadFile(SafePath, OutData, nullptr))
-		{
-			OutError = FString::Printf(
-				TEXT("Entry was not found or could not be extracted:\n%s\n\nArchive:\n%s"),
-				*SafePath,
-				*ArchivePath);
-			return false;
-		}
-
-		if (static_cast<int64>(OutData.Num()) > MaxSingleFileSize)
-		{
-			OutData.Reset();
-			OutError = FString::Printf(
-				TEXT("The extracted file exceeds the size limit of %lld MB:\n%s"),
-				MaxSingleFileSize / (1024ll * 1024ll),
-				*SafePath);
-			return false;
-		}
-
-		return true;
-	}
+    bool ReadArchiveEntry(const FString& ArchivePath, const FString& EntryPath, int64 Remaining,
+        TArray<uint8>& OutData, FString& OutError)
+    {
+        FString SafePath;
+        if (!IsSafeRelativePath(EntryPath, SafePath))
+        {
+            OutError = TEXT("Invalid ZIP entry path.");
+            return false;
+        }
+        zip_t* Archive = zip_open(TCHAR_TO_UTF8(*ArchivePath), ZIP_RDONLY, nullptr);
+        if (Archive)
+        {
+            ON_SCOPE_EXIT { zip_discard(Archive); };
+            const zip_int64_t Count = zip_get_num_entries(Archive, 0);
+            if (Count >= 0 && Count <= MaxArchiveFiles)
+            {
+                for (zip_int64_t Index = 0; Index < Count; ++Index)
+                {
+                    const char* Name = zip_get_name(Archive, Index, 0);
+                    FString Normalized;
+                    if (Name && IsSafeRelativePath(UTF8_TO_TCHAR(Name), Normalized) && Normalized == SafePath)
+                    {
+                        if (ReadEntry(Archive, Index, Remaining, OutData))
+                        {
+                            return true;
+                        }
+                        break;
+                    }
+                }
+            }
+        }
+        OutError = FString::Printf(TEXT("Cannot read ZIP entry within extraction limits: %s"), *EntryPath);
+        return false;
+    }
 
 	bool WriteFile(const FString& OutputPath, const TArray<uint8>& Data, FString& OutError)
 	{
@@ -357,12 +349,15 @@ namespace ZipImporter
 
 		FString CurrentArchivePath = FPaths::ConvertRelativePathToFull(ArchivePath);
 		TArray<uint8> FileData;
+        const FString NestedDirectory = FPaths::Combine(FPaths::ProjectSavedDir(), TEXT("ZipImporter/Reimport/Nested"), FGuid::NewGuid().ToString());
+        ON_SCOPE_EXIT { IFileManager::Get().DeleteDirectory(*NestedDirectory, false, true); };
+		int64 Remaining = MaxTotalSize;
 
 		for (int32 Index = 0; Index < ArchiveChain.Num(); ++Index)
 		{
 			const FString& EntryPath = ArchiveChain[Index];
 
-			if (!ReadArchiveEntry(CurrentArchivePath, EntryPath, FileData, OutError))
+			if (!ReadArchiveEntry(CurrentArchivePath, EntryPath, Remaining, FileData, OutError))
 			{
 				OutError = FString::Printf(
 					TEXT("Failed to resolve source chain at step %d of %d.\n\n%s"),
@@ -372,6 +367,7 @@ namespace ZipImporter
 				return false;
 			}
 
+			Remaining -= FileData.Num();
 			if (Index < ArchiveChain.Num() - 1)
 			{
 				if (!IsZipFile(EntryPath))
@@ -382,23 +378,7 @@ namespace ZipImporter
 					return false;
 				}
 
-				const FString IntermediateDirectory = FPaths::Combine(
-					FPaths::ProjectSavedDir(),
-					TEXT("ZipImporter"),
-					TEXT("Reimport"),
-					TEXT("Nested"),
-					FString::Printf(
-						TEXT("%08x"),
-						GetTypeHash(ArchivePath + TEXT("|") + [&ArchiveChain, Index]()
-						{
-							TArray<FString> ChainPart;
-							ChainPart.Append(ArchiveChain.GetData(), Index + 1);
-							return SerializeChain(ChainPart);
-						}())));
-
-				CurrentArchivePath = FPaths::Combine(
-					IntermediateDirectory,
-					FPaths::GetCleanFilename(EntryPath));
+                CurrentArchivePath = FPaths::Combine(NestedDirectory, FString::FromInt(Index) + TEXT(".zip"));
 
 				if (!WriteFile(CurrentArchivePath, FileData, OutError))
 				{
@@ -468,47 +448,32 @@ namespace ZipImporter
 
 		Context.VisitedArchives.Add(ArchiveKey);
 
-		IPlatformFile& PlatformFile = FPlatformFileManager::Get().GetPlatformFile();
-		IFileHandle* FileHandle = PlatformFile.OpenRead(*CanonicalArchivePath);
-
-		if (!FileHandle)
-		{
-			Context.FailedPaths.Add(FString::Printf(
-				TEXT("Could not open archive:\n%s"),
-				*CanonicalArchivePath));
-			Context.VisitedArchives.Remove(ArchiveKey);
-			return false;
-		}
-
-		FZipArchiveReader ArchiveReader(FileHandle, nullptr);
-
-		if (!ArchiveReader.IsValid())
-		{
-			Context.FailedPaths.Add(FString::Printf(
-				TEXT("Could not read archive:\n%s"),
-				*CanonicalArchivePath));
-			Context.VisitedArchives.Remove(ArchiveKey);
-			return false;
-		}
-
-		const TArray<FString> ArchiveFiles = ArchiveReader.GetFileNames();
-
-		for (const FString& ArchiveFile : ArchiveFiles)
-		{
+        zip_t* Archive = zip_open(TCHAR_TO_UTF8(*CanonicalArchivePath), ZIP_RDONLY, nullptr);
+        if (!Archive)
+        {
+            Context.FailedPaths.Add(FString::Printf(TEXT("Could not open archive: %s"), *CanonicalArchivePath));
+            return false;
+        }
+        ON_SCOPE_EXIT { zip_discard(Archive); };
+        const zip_int64_t Count = zip_get_num_entries(Archive, 0);
+        if (Count < 0 || Count > MaxArchiveFiles - Context.ProcessedFiles)
+        {
+            Context.FailedPaths.Add(TEXT("Archive entry count exceeds the import limit."));
+            return false;
+        }
+        Context.ProcessedFiles += static_cast<int32>(Count);
+        for (zip_int64_t Index = 0; Index < Count; ++Index)
+        {
+            const char* Name = zip_get_name(Archive, Index, 0);
+            if (!Name)
+            {
+                Context.FailedPaths.Add(TEXT("Could not read ZIP entry name."));
+                return false;
+            }
+            const FString ArchiveFile(UTF8_TO_TCHAR(Name));
 			if (ArchiveFile.EndsWith(TEXT("/")) || ArchiveFile.EndsWith(TEXT("\\")))
 			{
 				continue;
-			}
-
-			++Context.ProcessedFiles;
-
-			if (Context.ProcessedFiles > MaxArchiveFiles)
-			{
-				Context.FailedPaths.Add(FString::Printf(
-					TEXT("Archive contains more than %d files."),
-					MaxArchiveFiles));
-				Context.VisitedArchives.Remove(ArchiveKey);
-				return false;
 			}
 
 			FString RelativeFilePath;
@@ -523,21 +488,12 @@ namespace ZipImporter
 
 			TArray<uint8> FileData;
 
-			if (!ArchiveReader.TryReadFile(RelativeFilePath, FileData, nullptr))
-			{
-				Context.FailedPaths.Add(FString::Printf(
-					TEXT("Could not extract archive entry:\n%s"),
-					*RelativeFilePath));
-				continue;
-			}
-
-			if (static_cast<int64>(FileData.Num()) > MaxSingleFileSize)
-			{
-				Context.FailedPaths.Add(FString::Printf(
-					TEXT("File exceeds the size limit:\n%s"),
-					*RelativeFilePath));
-				continue;
-			}
+            if (!ReadEntry(Archive, Index, MaxTotalSize - Context.ExtractedBytes, FileData))
+            {
+                Context.FailedPaths.Add(FString::Printf(TEXT("ZIP entry is invalid or exceeds extraction limits: %s"), *RelativeFilePath));
+                return false;
+            }
+            Context.ExtractedBytes += FileData.Num();
 
 			TArray<FString> CurrentChain = ParentChain;
 			CurrentChain.Add(RelativeFilePath);
@@ -549,7 +505,7 @@ namespace ZipImporter
 					Context.FailedPaths.Add(FString::Printf(
 						TEXT("Maximum ZIP nesting depth exceeded:\n%s"),
 						*SerializeChain(CurrentChain)));
-					continue;
+					return false;
 				}
 
 				const FString NestedArchivePath = FPaths::Combine(
@@ -579,12 +535,18 @@ namespace ZipImporter
 				NestedDestination /= FPaths::GetBaseFilename(RelativeFilePath);
 				NestedDestination.ReplaceInline(TEXT("\\"), TEXT("/"));
 
-				ProcessArchiveRecursive(
+				FileData.Empty();
+				const bool bProcessed = ProcessArchiveRecursive(
 					NestedArchivePath,
 					NestedDestination,
 					CurrentChain,
 					Depth + 1,
 					Context);
+				IFileManager::Get().Delete(*NestedArchivePath);
+				if (!bProcessed)
+				{
+					return false;
+				}
 
 				continue;
 			}
@@ -796,6 +758,13 @@ void FZipImporterModule::StartupModule()
 
 void FZipImporterModule::ShutdownModule()
 {
+    if (FContentBrowserModule* Browser = FModuleManager::GetModulePtr<FContentBrowserModule>(TEXT("ContentBrowser")))
+    {
+        Browser->GetAssetViewDragAndDropExtenders().RemoveAll([this](const FAssetViewDragAndDropExtender& Extender)
+        {
+            return Extender.OnDropDelegate.IsBoundToObject(this);
+        });
+    }
 	delete ReimportHandler;
 	ReimportHandler = nullptr;
 }
@@ -824,20 +793,20 @@ bool FZipImporterModule::CanHandleZipDrop(
 
 	const FString DestinationPath = Payload.PackagePaths[0].ToString();
 
-	if (!DestinationPath.StartsWith(TEXT("/Game")))
+	if (DestinationPath != TEXT("/Game") && !DestinationPath.StartsWith(TEXT("/Game/")))
 	{
 		return false;
 	}
 
 	for (const FString& FilePath : ExternalOperation->GetFiles())
 	{
-		if (ZipImporter::IsZipFile(FilePath))
+		if (!ZipImporter::IsZipFile(FilePath))
 		{
-			return true;
+			return false;
 		}
 	}
 
-	return false;
+	return true;
 }
 
 bool FZipImporterModule::OnAssetViewDragOver(
@@ -911,7 +880,8 @@ UObject* FZipImporterModule::ImportArchiveToPackagePath(
 
     ZipImporter::FImportContext Context;
     Context.ArchivePath = ArchiveAbsolutePath;
-    Context.StagingDirectory = StagingDirectory;
+    Context.StagingDirectory = FPaths::Combine(StagingDirectory, TEXT("Preparing"), FGuid::NewGuid().ToString());
+    ON_SCOPE_EXIT { IFileManager::Get().DeleteDirectory(*Context.StagingDirectory, false, true); };
 
     if (!IFileManager::Get().MakeDirectory(*StagingDirectory, true))
     {
@@ -923,25 +893,58 @@ UObject* FZipImporterModule::ImportArchiveToPackagePath(
         return nullptr;
     }
 
-    ZipImporter::ProcessArchiveRecursive(
+    const bool bPrepared = ZipImporter::ProcessArchiveRecursive(
         ArchiveAbsolutePath,
         DestinationPackagePath,
         TArray<FString>(),
         0,
         Context);
 
-    if (Context.Sources.IsEmpty())
+    for (const FString& Problem : Context.FailedPaths)
+    {
+        UE_LOG(LogTemp, Warning, TEXT("%s"), *Problem);
+    }
+    if (!bPrepared || Context.Sources.IsEmpty())
     {
         FString Message = TEXT("No files were available for import.");
 
         if (!Context.FailedPaths.IsEmpty())
         {
             Message += TEXT("\n\n");
-            Message += FString::Join(Context.FailedPaths, TEXT("\n\n"));
+            Message += Context.FailedPaths[0] + TEXT("\nSee Output Log for details.");
         }
 
         ZipImporter::ShowMessage(Message);
         return nullptr;
+    }
+
+    TArray<FString> ExistingPackages;
+    for (const ZipImporter::FImportSource& Source : Context.Sources)
+    {
+        const FString AssetName = ObjectTools::SanitizeObjectName(FPaths::GetBaseFilename(Source.DiskPath));
+        const FString PackageName = Source.DestinationPath / AssetName;
+        if (FPackageName::IsValidLongPackageName(PackageName)
+            && (FindPackage(nullptr, *PackageName) || FPackageName::DoesPackageExist(PackageName)))
+        {
+            ExistingPackages.AddUnique(PackageName);
+        }
+    }
+    if (!ExistingPackages.IsEmpty())
+    {
+        ExistingPackages.Sort();
+        for (const FString& Package : ExistingPackages)
+        {
+            UE_LOG(LogTemp, Display, TEXT("ZIP import destination already exists: %s"), *Package);
+        }
+        const int32 Count = ExistingPackages.Num();
+        ExistingPackages.SetNum(FMath::Min(Count, 12));
+        const FText Prompt = FText::Format(
+            NSLOCTEXT("ZipImporter", "ExistingDestinations", "{0} existing destination package(s) found. First matches:\n{1}\n\nThe complete list is in the Output Log. Continue with import?"),
+            FText::AsNumber(Count), FText::FromString(FString::Join(ExistingPackages, TEXT("\n"))));
+        if (FMessageDialog::Open(EAppMsgType::YesNo, Prompt) != EAppReturnType::Yes)
+        {
+            return nullptr;
+        }
     }
 
     TArray<UAssetImportTask*> ImportTasks;
@@ -951,11 +954,19 @@ UObject* FZipImporterModule::ImportArchiveToPackagePath(
 
     for (const ZipImporter::FImportSource& Source : Context.Sources)
     {
+        const FString RelativeSource = Source.DiskPath.Mid(Context.StagingDirectory.Len() + 1);
+        const FString FactorySource = FPaths::Combine(StagingDirectory, RelativeSource);
+        IFileManager::Get().MakeDirectory(*FPaths::GetPath(FactorySource), true);
+        if (!IFileManager::Get().Move(*FactorySource, *Source.DiskPath, true, false))
+        {
+            ZipImporter::ShowMessage(FString::Printf(TEXT("Could not prepare import source: %s"), *FactorySource));
+            return nullptr;
+        }
         UAssetImportTask* Task = NewObject<UAssetImportTask>();
-        Task->Filename = Source.DiskPath;
+        Task->Filename = FactorySource;
         Task->DestinationPath = Source.DestinationPath;
         Task->bAutomated = false;
-        Task->bReplaceExisting = true;
+        Task->bReplaceExisting = false;
         Task->bSave = false;
 
         ImportTasks.Add(Task);
@@ -993,6 +1004,7 @@ UObject* FZipImporterModule::ImportArchiveToPackagePath(
 
         if (ImportedObjects.IsEmpty())
         {
+            UE_LOG(LogTemp, Warning, TEXT("ZIP asset import failed: %s -> %s"), *ZipImporter::SerializeChain(*ArchiveChain), *Task->DestinationPath);
             ++FailedImportTasks;
             continue;
         }

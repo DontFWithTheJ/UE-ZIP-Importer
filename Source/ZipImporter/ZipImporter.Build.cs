@@ -24,7 +24,7 @@ public class ZipImporter : ModuleRules
 				"AssetTools",
 				"DesktopPlatform",
 				"Projects",
-				"FileUtilities",
+				"libzip",
 				"ContentBrowser"
 			});
 	}
